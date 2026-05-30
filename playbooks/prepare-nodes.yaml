@@ -39,6 +39,15 @@
     - name: Применить параметры ядра
       command: sysctl --system
 
+    - name: Удалить старые репозитории Kubernetes
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/sources.list.d/deb.nodesource.com_node_12.x.list 
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
     - name: Установить зависимости для apt
       apt:
         name:
@@ -99,11 +108,14 @@
           deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /
         mode: '0644'
 
+    - name: Обновить кэш apt после добавления репозитория
+      apt:
+        update_cache: yes
+
     - name: Установить kubeadm
       apt:
         name: kubeadm
         state: present
-        update_cache: yes
 
     - name: Установить kubelet
       apt:
