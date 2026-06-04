@@ -1,0 +1,145 @@
+---
+- name: Инициализация первого управляющего узла Kubernetes (control-plane)
+  hosts: master1
+  become: true
+
+  vars:
+    control_plane_endpoint: "192.168.0.100:6443"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    cri_socket: "unix:///run/cri-dockerd.sock"
+    kube_user: "admin"
+    calico_version: "v3.32.0"
+
+  tasks:
+
+    - name: Проверить наличие сокета cri-dockerd
+      stat:
+        path: /run/cri-dockerd.sock
+      register: cri_socket_file
+
+    - name: Завершить с ошибкой, если сокет cri-dockerd отсутствует
+      fail:
+        msg: "Сокет cri-dockerd /run/cri-dockerd.sock не найден"
+      when: not cri_socket_file.stat.exists
+
+    - name: Проверить, инициализирован ли уже кластер
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Загрузить образы Kubernetes
+      command: >
+        kubeadm config images pull
+        --cri-socket {{ cri_socket }}
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Инициализировать первый управляющий узел
+      command: >
+        kubeadm init
+        --control-plane-endpoint {{ control_plane_endpoint }}
+        --upload-certs
+        --pod-network-cidr {{ pod_network_cidr }}
+        --service-cidr {{ service_cidr }}
+        --cri-socket {{ cri_socket }}
+      register: kubeadm_init
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Ожидать готовности API-сервера
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+      register: kubectl_result
+      until: kubectl_result.rc == 0
+      retries: 30
+      delay: 5
+
+    - name: Создать директорию конфигурации kubectl
+      file:
+        path: "/home/{{ kube_user }}/.kube"
+        state: directory
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0755"
+
+    - name: Скопировать admin kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ kube_user }}/.kube/config"
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0600"
+        remote_src: true
+
+    - name: Сгенерировать ключ сертификата
+      shell: kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1
+      register: certificate_key
+      changed_when: false
+
+    - name: Сгенерировать команду присоединения worker-узлов
+      command: kubeadm token create --print-join-command
+      register: worker_join_command
+      changed_when: false
+
+    - name: Сохранить скрипт присоединения worker-узлов
+      copy:
+        dest: /root/worker_join.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ worker_join_command.stdout }} \
+            --cri-socket {{ cri_socket }}
+
+    - name: Сохранить скрипт присоединения управляющих узлов
+      copy:
+        dest: /root/controlplane_join.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ worker_join_command.stdout }} \
+            --control-plane \
+            --certificate-key {{ certificate_key.stdout }} \
+            --cri-socket {{ cri_socket }}
+
+    - name: Загрузить манифест пользовательских ресурсов Calico
+      get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
+        dest: /tmp/calico-custom-resources.yaml
+        force: true
+
+    - name: Пропатчить CIDR в манифесте Calico
+      replace:
+        path: /tmp/calico-custom-resources.yaml
+        regexp: '192\.168\.0\.0/16'
+        replace: "{{ pod_network_cidr }}"
+
+    - name: Установить оператор Calico
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+
+    - name: Ожидать регистрации CRD Installation
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get crd installations.operator.tigera.io
+      register: crd_ready
+      until: crd_ready.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Применить пользовательские ресурсы Calico
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        apply -f /tmp/calico-custom-resources.yaml
+
+    - name: Ожидать перехода узла в состояние Ready
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get node {{ inventory_hostname }}
+        -o jsonpath={.status.conditions[?(@.type=="Ready")].status}
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      changed_when: false
+      
