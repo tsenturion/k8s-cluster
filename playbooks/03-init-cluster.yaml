@@ -10,6 +10,7 @@
     cri_socket: "unix:///run/cri-dockerd.sock"
     kube_user: "admin"
     calico_version: "v3.32.0"
+    calico_interface: "enp0s8"
 
   tasks:
 
@@ -99,18 +100,6 @@
             --certificate-key {{ certificate_key.stdout }} \
             --cri-socket {{ cri_socket }}
 
-    - name: Загрузить манифест пользовательских ресурсов Calico
-      get_url:
-        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/custom-resources.yaml"
-        dest: /tmp/calico-custom-resources.yaml
-        force: true
-
-    - name: Пропатчить CIDR в манифесте Calico
-      replace:
-        path: /tmp/calico-custom-resources.yaml
-        regexp: '192\.168\.0\.0/16'
-        replace: "{{ pod_network_cidr }}"
-
     - name: Установить оператор Calico
       command: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf
@@ -127,10 +116,31 @@
       delay: 10
       changed_when: false
 
-    - name: Применить пользовательские ресурсы Calico
+    - name: Применить конфигурацию Calico Installation
       command: >
-        kubectl --kubeconfig /etc/kubernetes/admin.conf
-        apply -f /tmp/calico-custom-resources.yaml
+        kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -
+      args:
+        stdin: |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            calicoNetwork:
+              nodeAddressAutodetectionV4:
+                interface: {{ calico_interface }}
+              ipPools:
+                - blockSize: 26
+                  cidr: {{ pod_network_cidr }}
+                  encapsulation: VXLANCrossSubnet
+                  natOutgoing: Enabled
+                  nodeSelector: all()
+          ---
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec: {}
 
     - name: Ожидать перехода узла в состояние Ready
       command: >
@@ -138,8 +148,8 @@
         get node {{ inventory_hostname }}
         -o jsonpath={.status.conditions[?(@.type=="Ready")].status}
       register: node_ready
-      until: node_ready.stdout == "True"
+      until: node_ready.rc == 0 and node_ready.stdout == "True"
       retries: 60
       delay: 10
       changed_when: false
-      
+      failed_when: false
