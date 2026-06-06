@@ -116,6 +116,11 @@
       delay: 10
       changed_when: false
 
+    - name: Удалить дефолтный Installation если существует
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        delete installation default --ignore-not-found=true
+        
     - name: Применить конфигурацию Calico Installation
       command: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -
