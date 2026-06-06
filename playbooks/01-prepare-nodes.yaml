@@ -13,7 +13,7 @@
     - name: Установить hostname согласно inventory
       hostname:
         name: "{{ inventory_hostname }}"
-        use_hostname_file: true
+        use: systemd
 
     - name: Отключить swap
       shell: swapoff -a
