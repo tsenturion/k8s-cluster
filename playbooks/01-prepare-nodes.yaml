@@ -19,6 +19,15 @@
         regexp: '^([^#].*\sswap\s.*)$'
         replace: '#\1'
 
+    - name: Обеспечить наличие localhost в /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "127.0.0.1 localhost"
+        - "::1       localhost"
+
     - name: Загрузить модули ядра (конфиг)
       copy:
         dest: /etc/modules-load.d/k8s.conf
