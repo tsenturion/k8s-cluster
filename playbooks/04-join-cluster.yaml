@@ -1,0 +1,251 @@
+---
+# Подключение остальных узлов к кластеру
+- name: Обновить join-скрипты на master1
+  hosts: master1
+  become: true
+
+  vars:
+    cri_socket: "unix:///run/cri-dockerd.sock"
+
+  tasks:
+
+    - name: Проверить наличие admin.conf
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Завершить выполнение если кластер не инициализирован
+      fail:
+        msg: "Кластер еще не создан. Сначала выполните 03-init-cluster.yaml"
+      when: not admin_conf.stat.exists
+
+    - name: Сгенерировать новый certificate-key
+      shell: kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1
+      register: certificate_key
+      changed_when: false
+
+    - name: Сгенерировать новую команду подключения
+      command: kubeadm token create --print-join-command
+      register: worker_join_command
+      changed_when: false
+
+    - name: Обновить worker join script
+      copy:
+        dest: /root/worker_join.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ worker_join_command.stdout }} \
+            --cri-socket {{ cri_socket }}
+
+    - name: Обновить control-plane join script
+      copy:
+        dest: /root/controlplane_join.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ worker_join_command.stdout }} \
+            --control-plane \
+            --certificate-key {{ certificate_key.stdout }} \
+            --cri-socket {{ cri_socket }}
+
+# ЧАСТЬ 2: Получить join-скрипты локально
+- name: Скопировать join-скрипты на ansible-controller
+  hosts: master1
+  become: true
+
+  tasks:
+
+    - name: Скачать worker join script
+      fetch:
+        src: /root/worker_join.sh
+        dest: /tmp/worker_join.sh
+        flat: true
+
+    - name: Скачать control-plane join script
+      fetch:
+        src: /root/controlplane_join.sh
+        dest: /tmp/controlplane_join.sh
+        flat: true
+
+# ЧАСТЬ 3: Подключение остальных control-plane
+- name: Подключение control-plane узлов
+  hosts: master2,master3
+  become: true
+  serial: 1
+
+  vars:
+    kube_user: "admin"
+    join_script_remote: "/tmp/controlplane_join.sh"
+
+  tasks:
+
+    - name: Проверить входит ли узел в кластер
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Скопировать join script
+      copy:
+        src: /tmp/controlplane_join.sh
+        dest: "{{ join_script_remote }}"
+        mode: "0700"
+      when: not kubelet_conf.stat.exists
+
+    - name: Выполнить подключение control-plane
+      command: bash {{ join_script_remote }}
+      register: join_result
+      when: not kubelet_conf.stat.exists
+
+    - name: Показать результат подключения
+      debug:
+        var: join_result.stdout_lines
+      when:
+        - join_result is defined
+        - join_result.stdout_lines is defined
+
+    - name: Ожидать появления admin.conf
+      wait_for:
+        path: /etc/kubernetes/admin.conf
+        timeout: 180
+      when: not kubelet_conf.stat.exists
+
+    - name: Создать директорию .kube
+      file:
+        path: "/home/{{ kube_user }}/.kube"
+        state: directory
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0755"
+
+    - name: Скопировать kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ kube_user }}/.kube/config"
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0600"
+        remote_src: true
+
+    - name: Удалить временный join script
+      file:
+        path: "{{ join_script_remote }}"
+        state: absent
+
+    - name: Ожидать регистрацию узла
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get node {{ inventory_hostname }}
+      delegate_to: master1
+      register: node_exists
+      until: node_exists.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Ожидать Ready
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        wait node/{{ inventory_hostname }}
+        --for=condition=Ready
+        --timeout=300s
+      delegate_to: master1
+      changed_when: false
+
+# ЧАСТЬ 4: Подключение worker-узлов
+- name: Подключение worker-узлов
+  hosts: workers
+  become: true
+  serial: 1
+
+  vars:
+    join_script_remote: "/tmp/worker_join.sh"
+
+  tasks:
+
+    - name: Проверить входит ли узел в кластер
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Скопировать join script
+      copy:
+        src: /tmp/worker_join.sh
+        dest: "{{ join_script_remote }}"
+        mode: "0700"
+      when: not kubelet_conf.stat.exists
+
+    - name: Выполнить подключение worker
+      command: bash {{ join_script_remote }}
+      register: join_result
+      when: not kubelet_conf.stat.exists
+
+    - name: Показать результат подключения
+      debug:
+        var: join_result.stdout_lines
+      when:
+        - join_result is defined
+        - join_result.stdout_lines is defined
+
+    - name: Удалить временный join script
+      file:
+        path: "{{ join_script_remote }}"
+        state: absent
+
+    - name: Ожидать регистрацию узла
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get node {{ inventory_hostname }}
+      delegate_to: master1
+      register: node_exists
+      until: node_exists.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Ожидать Ready
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        wait node/{{ inventory_hostname }}
+        --for=condition=Ready
+        --timeout=300s
+      delegate_to: master1
+      changed_when: false
+
+# ЧАСТЬ 5: Финальная проверка
+- name: Проверка состояния кластера
+  hosts: master1
+  become: true
+
+  tasks:
+
+    - name: Показать все узлы
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести список узлов
+      debug:
+        var: nodes_output.stdout_lines
+
+    - name: Показать системные поды
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get pods -n kube-system -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Вывести системные поды
+      debug:
+        var: pods_output.stdout_lines
+
+    - name: Проверить статус control-plane
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get nodes
+      register: cluster_status
+      changed_when: false
+
+    - name: Итоговый статус
+      debug:
+        var: cluster_status.stdout_lines
