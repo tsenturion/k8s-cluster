@@ -10,6 +10,11 @@
 
   tasks:
     # 1. ПРЕДВАРИТЕЛЬНАЯ НАСТРОЙКА ОС
+    - name: Установить hostname согласно inventory
+      hostname:
+        name: "{{ inventory_hostname }}"
+        use_hostname_file: true
+
     - name: Отключить swap
       shell: swapoff -a
 
@@ -27,6 +32,13 @@
       loop:
         - "127.0.0.1 localhost"
         - "::1       localhost"
+
+    - name: Добавить все узлы кластера в /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+        state: present
+      loop: "{{ groups['all'] }}"
 
     - name: Загрузить модули ядра (конфиг)
       copy:
