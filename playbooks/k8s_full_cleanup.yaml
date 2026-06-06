@@ -1,0 +1,147 @@
+---
+- name: Полная очистка Kubernetes кластера
+  hosts: all
+  become: yes
+
+  tasks:
+
+    - name: Остановка kubelet
+      systemd:
+        name: kubelet
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Остановка контейнерных рантаймов
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - docker
+        - containerd
+        - cri-docker
+      ignore_errors: yes
+
+    - name: Принудительная размонтирование точек монтирования kubelet
+      shell: |
+        mount | grep /var/lib/kubelet | awk '{print $3}' | xargs -r umount -f
+      ignore_errors: yes
+
+    - name: Очистка запущенных контейнеров (docker)
+      shell: |
+        docker ps -aq | xargs -r docker rm -f
+      ignore_errors: yes
+
+    - name: Очистка запущенных контейнеров (containerd)
+      shell: |
+        crictl ps -aq | xargs -r crictl rm -f
+      ignore_errors: yes
+
+    - name: Убить процессы kubelet и связанные
+      shell: |
+        pkill -9 kubelet || true
+        pkill -9 kube-proxy || true
+        pkill -9 containerd-shim || true
+      ignore_errors: yes
+
+    - name: kubeadm reset с указанием CRI (containerd)
+      command: kubeadm reset -f --cri-socket=unix:///var/run/containerd/containerd.sock
+      ignore_errors: yes
+
+    - name: Альтернативный kubeadm reset (cri-dockerd если нужен)
+      command: kubeadm reset -f --cri-socket=unix:///var/run/cri-dockerd.sock
+      ignore_errors: yes
+
+    - name: Повторная остановка kubelet после reset
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Удаление Kubernetes директорий
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni
+        - /var/lib/cni
+        - /opt/cni
+        - /var/lib/kube-proxy
+        - /var/lib/kube-scheduler
+        - /var/lib/kube-controller-manager
+        - /var/lib/kubelet-plugins
+        - /var/lib/kubelet-plugins-volume
+        - /var/lib/kubelet-volume
+      ignore_errors: yes
+
+    - name: Очистка Calico интерфейсов
+      shell: |
+        for i in $(ip -o link show | awk -F': ' '{print $2}' | grep -E '^cali|cni0|tunl0|flannel|veth|docker|br-'); do
+          ip link delete $i 2>/dev/null || true
+        done
+      ignore_errors: yes
+
+    - name: Очистка iptables правил
+      shell: |
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+        iptables -t nat -X
+        iptables -t mangle -X
+        ip6tables -F
+        ip6tables -t nat -F
+        ip6tables -t mangle -F
+        ip6tables -X
+      ignore_errors: yes
+
+    - name: Очистка bridge network
+      shell: |
+        ip link delete docker0 2>/dev/null || true
+        ip link delete cni0 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Удаление конфигурационных файлов
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /root/.kube
+        - /home/*/.kube
+        - /etc/cni/net.d
+        - /opt/cni/bin
+        - /var/log/pods
+        - /var/log/containers
+      ignore_errors: yes
+
+    - name: Снять hold с Kubernetes пакетов
+      shell: |
+        apt-mark unhold kubeadm kubelet kubectl kubernetes-cni
+      ignore_errors: yes
+
+    - name: Удаление пакетов Kubernetes
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+          - kubernetes-cni
+        state: absent
+        purge: yes
+        allow_change_held_packages: yes
+      ignore_errors: yes
+
+    - name: Очистка кэша apt
+      apt:
+        autoremove: yes
+        autoclean: yes
+      ignore_errors: yes
+
+    - name: Перезагрузка узла
+      reboot:
+        reboot_timeout: 600
+        pre_reboot_delay: 5
+      ignore_errors: yes
