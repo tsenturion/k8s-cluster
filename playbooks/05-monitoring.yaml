@@ -1,0 +1,236 @@
+---
+# =============================================================================
+# ПЛЕЙБУК: Установка стека мониторинга Prometheus + Grafana
+# Использует kube-prometheus-stack (Helm chart)
+# Grafana будет доступна через NodePort на порту 30300
+# =============================================================================
+- name: Установка стека мониторинга (Prometheus + Grafana)
+  hosts: master1
+  become: true
+
+  vars:
+    kube_user: "admin"
+    kubeconfig: "/home/{{ kube_user }}/.kube/config"
+    helm_version: "v4.2.0"
+    monitoring_namespace: "monitoring"
+    grafana_admin_password: "Adm1nGrafana2026"
+    grafana_nodeport: "30300"
+    prometheus_nodeport: "30900"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 1. УСТАНОВКА HELM
+    # -------------------------------------------------------------------------
+    - name: Проверить наличие helm
+      command: helm version --short
+      register: helm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Скачать и установить Helm
+      block:
+        - name: Скачать архив Helm
+          get_url:
+            url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+            dest: "/tmp/helm-{{ helm_version }}-linux-amd64.tar.gz"
+
+        - name: Распаковать Helm
+          unarchive:
+            src: "/tmp/helm-{{ helm_version }}-linux-amd64.tar.gz"
+            dest: /tmp
+            remote_src: yes
+
+        - name: Переместить helm в /usr/local/bin
+          copy:
+            src: /tmp/linux-amd64/helm
+            dest: /usr/local/bin/helm
+            mode: "0755"
+            remote_src: yes
+
+        - name: Очистить временные файлы Helm
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "/tmp/helm-{{ helm_version }}-linux-amd64.tar.gz"
+            - /tmp/linux-amd64
+      when: helm_check.rc != 0
+
+    - name: Проверить версию Helm
+      command: helm version --short
+      register: helm_ver
+      changed_when: false
+
+    - name: Вывести версию Helm
+      debug:
+        var: helm_ver.stdout
+
+    # -------------------------------------------------------------------------
+    # 2. ПОДГОТОВКА NAMESPACE
+    # -------------------------------------------------------------------------
+    - name: Создать namespace для мониторинга
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        create namespace {{ monitoring_namespace }}
+      register: ns_result
+      failed_when:
+        - ns_result.rc != 0
+        - '"already exists" not in ns_result.stderr'
+      changed_when: ns_result.rc == 0
+
+    # -------------------------------------------------------------------------
+    # 3. ДОБАВЛЕНИЕ HELM-РЕПОЗИТОРИЯ
+    # -------------------------------------------------------------------------
+    - name: Добавить репозиторий prometheus-community
+      command: >
+        helm repo add prometheus-community
+        https://prometheus-community.github.io/helm-charts
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: repo_add
+      changed_when: '"already exists" not in repo_add.stdout'
+      failed_when:
+        - repo_add.rc != 0
+        - '"already exists" not in repo_add.stdout'
+
+    - name: Обновить репозитории Helm
+      command: helm repo update
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      changed_when: false
+
+    # -------------------------------------------------------------------------
+    # 4. УСТАНОВКА kube-prometheus-stack
+    # -------------------------------------------------------------------------
+    - name: Установить / обновить kube-prometheus-stack
+      command: >
+        helm upgrade --install kube-prom-stack
+        prometheus-community/kube-prometheus-stack
+        --namespace {{ monitoring_namespace }}
+        --set grafana.adminPassword="{{ grafana_admin_password }}"
+        --set grafana.service.type=NodePort
+        --set grafana.service.nodePort={{ grafana_nodeport }}
+        --set prometheus.service.type=NodePort
+        --set prometheus.service.nodePort={{ prometheus_nodeport }}
+        --set prometheus.prometheusSpec.retention=15d
+        --set prometheus-node-exporter.enabled=true
+        --set kube-state-metrics.enabled=true
+        --set alertmanager.enabled=true
+        --set defaultRules.create=true
+        --timeout 10m
+        --wait
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: helm_install
+
+    - name: Вывести результат установки Helm
+      debug:
+        var: helm_install.stdout_lines
+
+    # -------------------------------------------------------------------------
+    # 5. ОЖИДАНИЕ ГОТОВНОСТИ ПОДОВ
+    # -------------------------------------------------------------------------
+    - name: Ожидать готовности Grafana
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        wait deployment
+        --namespace {{ monitoring_namespace }}
+        --selector "app.kubernetes.io/name=grafana"
+        --for=condition=Available
+        --timeout=300s
+      changed_when: false
+
+    - name: Ожидать готовности Prometheus
+      shell: |
+        # Имя StatefulSet зависит от версии чарта — находим по label
+        SS=$(kubectl --kubeconfig {{ kubeconfig }} get statefulset \
+          -n {{ monitoring_namespace }} \
+          -l "app.kubernetes.io/name=prometheus" \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$SS" ]; then
+          echo "StatefulSet prometheus не найден, пропускаем"
+          exit 0
+        fi
+        kubectl --kubeconfig {{ kubeconfig }} \
+          rollout status statefulset/"$SS" \
+          -n {{ monitoring_namespace }} \
+          --timeout=300s
+      register: prom_wait
+      changed_when: false
+      failed_when:
+        - prom_wait.rc != 0
+        - '"not found" not in prom_wait.stderr'
+
+    - name: Ожидать готовности node-exporter
+      shell: |
+        # Имя DaemonSet также зависит от версии чарта — находим по label
+        DS=$(kubectl --kubeconfig {{ kubeconfig }} get daemonset \
+          -n {{ monitoring_namespace }} \
+          -l "app.kubernetes.io/name=prometheus-node-exporter" \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$DS" ]; then
+          echo "DaemonSet node-exporter не найден, пропускаем"
+          exit 0
+        fi
+        kubectl --kubeconfig {{ kubeconfig }} \
+          rollout status daemonset/"$DS" \
+          -n {{ monitoring_namespace }} \
+          --timeout=300s
+      register: ne_wait
+      changed_when: false
+      failed_when:
+        - ne_wait.rc != 0
+        - '"not found" not in ne_wait.stderr'
+
+    # -------------------------------------------------------------------------
+    # 6. ИТОГОВАЯ ИНФОРМАЦИЯ
+    # -------------------------------------------------------------------------
+    - name: Показать все поды в namespace monitoring
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        get pods -n {{ monitoring_namespace }} -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Список подов мониторинга
+      debug:
+        var: pods_output.stdout_lines
+
+    - name: Показать сервисы
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        get svc -n {{ monitoring_namespace }}
+      register: svc_output
+      changed_when: false
+
+    - name: Список сервисов
+      debug:
+        var: svc_output.stdout_lines
+
+    - name: Получить IP мастер-ноды для доступа к UI
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        get node master1
+        -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}'
+      register: master_ip
+      changed_when: false
+
+    - name: "== ДОСТУП К UI =="
+      debug:
+        msg:
+          - "==========================================="
+          - " МОНИТОРИНГ ГОТОВ К ИСПОЛЬЗОВАНИЮ"
+          - "==========================================="
+          - ""
+          - "  Grafana:    http://{{ master_ip.stdout }}:{{ grafana_nodeport }}"
+          - "  Логин:      admin"
+          - "  Пароль:     {{ grafana_admin_password }}"
+          - ""
+          - "  Prometheus: http://{{ master_ip.stdout }}:{{ prometheus_nodeport }}"
+          - ""
+          - "  Рекомендуемые дашборды в Grafana:"
+          - "    ID 1860  — Node Exporter Full (CPU/RAM/Disk/Network нод)"
+          - "    ID 315   — Kubernetes cluster monitoring"
+          - "    ID 13332 — Kubernetes Pods (CPU и память по подам)"
+          - "==========================================="
