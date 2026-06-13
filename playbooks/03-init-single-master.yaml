@@ -1,0 +1,141 @@
+---
+- name: Инициализация single-master Kubernetes на master1
+  hosts: master1
+  become: true
+
+  vars:
+    apiserver_advertise_address: "192.168.0.33"
+    pod_network_cidr: "10.244.0.0/16"
+    service_cidr: "10.96.0.0/12"
+    cri_socket: "unix:///run/cri-dockerd.sock"
+    kube_user: "admin"
+    calico_version: "v3.32.0"
+    calico_interface: "enp0s8"
+
+  tasks:
+    - name: Проверить наличие сокета cri-dockerd
+      stat:
+        path: /run/cri-dockerd.sock
+      register: cri_socket_file
+
+    - name: Завершить с ошибкой, если сокет cri-dockerd отсутствует
+      fail:
+        msg: "Сокет cri-dockerd /run/cri-dockerd.sock не найден"
+      when: not cri_socket_file.stat.exists
+
+    - name: Проверить, инициализирован ли уже кластер
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Загрузить образы Kubernetes
+      command: >
+        kubeadm config images pull
+        --cri-socket {{ cri_socket }}
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Инициализировать single-master кластер
+      command: >
+        kubeadm init
+        --apiserver-advertise-address {{ apiserver_advertise_address }}
+        --pod-network-cidr {{ pod_network_cidr }}
+        --service-cidr {{ service_cidr }}
+        --cri-socket {{ cri_socket }}
+      register: kubeadm_init
+      when: not k8s_admin_conf.stat.exists
+
+    - name: Создать директорию .kube для admin
+      file:
+        path: "/home/{{ kube_user }}/.kube"
+        state: directory
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0755"
+
+    - name: Скопировать kubeconfig для admin
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ kube_user }}/.kube/config"
+        owner: "{{ kube_user }}"
+        group: "{{ kube_user }}"
+        mode: "0600"
+        remote_src: true
+
+    - name: Ожидать готовности API-сервера
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes
+      register: kubectl_result
+      until: kubectl_result.rc == 0
+      retries: 30
+      delay: 5
+      changed_when: false
+
+    - name: Установить оператор Calico
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/tigera-operator.yaml
+
+    - name: Ожидать регистрации CRD Installation
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get crd installations.operator.tigera.io
+      register: crd_ready
+      until: crd_ready.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Удалить дефолтный Installation если существует
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        delete installation default --ignore-not-found=true
+
+    - name: Применить конфигурацию Calico Installation
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -
+      args:
+        stdin: |
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            calicoNetwork:
+              nodeAddressAutodetectionV4:
+                interface: {{ calico_interface }}
+              ipPools:
+                - blockSize: 26
+                  cidr: {{ pod_network_cidr }}
+                  encapsulation: VXLANCrossSubnet
+                  natOutgoing: Enabled
+                  nodeSelector: all()
+          ---
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec: {}
+
+    - name: Разрешить запуск pod-ов на master1
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        taint nodes master1 node-role.kubernetes.io/control-plane- --overwrite
+      failed_when: false
+      changed_when: false
+
+    - name: Ожидать Ready master1
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        wait node/master1
+        --for=condition=Ready
+        --timeout=600s
+      changed_when: false
+
+    - name: Показать узлы
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести узлы
+      debug:
+        var: nodes_output.stdout_lines
