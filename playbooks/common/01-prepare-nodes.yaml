@@ -20,6 +20,9 @@
 #   одновременная загрузка пакетов на 5 ВМ в lab-сети часто дает timeout.
 #   Kubernetes-пакеты ставятся последовательно по узлам; для повторного запуска
 #   только этого этапа можно использовать tag kubernetes.
+#   По умолчанию Kubernetes apt repository берется с Yandex mirror. Чтобы
+#   использовать официальный pkgs.k8s.io, передайте:
+#   -e kubernetes_repo_source=official
 ################################################################################
 ---
 - name: Подготовка всех узлов к установке Kubernetes с Docker
@@ -29,6 +32,11 @@
   vars:
     # Версия Kubernetes для установки
     kubernetes_version: "1.36"
+    # Источник Kubernetes apt repository: yandex или official
+    kubernetes_repo_source: "yandex"
+    kubernetes_repo_yandex_url: "https://mirror.yandex.ru/mirrors/pkgs.k8s.io/core/stable/v{{ kubernetes_version }}"
+    kubernetes_repo_official_url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}"
+    kubernetes_repo_base_url: "{{ kubernetes_repo_official_url if kubernetes_repo_source == 'official' else kubernetes_repo_yandex_url }}"
     # Версия cri-dockerd. Уточните актуальную на https://github.com/Mirantis/cri-dockerd/releases
     cri_dockerd_version: "0.4.3"
     cri_dockerd_arch: "amd64"
@@ -267,6 +275,20 @@
         - cri-docker.service
 
     # 5. УСТАНОВКА КОМПОНЕНТОВ KUBERNETES
+    - name: Проверить выбранный источник Kubernetes repository
+      assert:
+        that:
+          - kubernetes_repo_source in ['yandex', 'official']
+        fail_msg: "kubernetes_repo_source должен быть yandex или official."
+      tags:
+        - kubernetes
+
+    - name: Показать выбранный источник Kubernetes repository
+      debug:
+        msg: "Kubernetes repository source={{ kubernetes_repo_source }}, url={{ kubernetes_repo_base_url }}/deb/"
+      tags:
+        - kubernetes
+
     - name: Удалить старые репозитории Kubernetes
       file:
         path: "{{ item }}"
@@ -280,7 +302,7 @@
 
     - name: Скачать GPG-ключ репозитория Kubernetes
       shell: >
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        curl -fsSL {{ kubernetes_repo_base_url }}/deb/Release.key
         | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -291,7 +313,7 @@
       copy:
         dest: /etc/apt/sources.list.d/kubernetes.list
         content: |
-          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] {{ kubernetes_repo_base_url }}/deb/ /
         mode: '0644'
       tags:
         - kubernetes

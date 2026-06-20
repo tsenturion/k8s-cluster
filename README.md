@@ -28,6 +28,14 @@ ansible all -i inventory/singlenode-lan.ini -m shell -a 'hostname; uptime; top -
 
 Ansible ad-hoc `shell` может показать `CHANGED`, но эта команда только читает состояние и ничего не меняет.
 
+Проверить SSH/Ansible подключение ко всем узлам inventory.
+
+```bash
+ansible all -i inventory/multinode-lan.ini -m ping
+```
+
+Для single-master проверки используйте тот же вызов с `inventory/singlenode-lan.ini`.
+
 ## Single-Master С Нуля
 
 Полностью очистить `master1`, `worker1`, `worker2` перед новой установкой.
@@ -42,10 +50,16 @@ ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/99-full-cleanu
 ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/00-network-check.yaml
 ```
 
-Подготовить `master1`, `worker1`, `worker2`: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl.
+Подготовить `master1`, `worker1`, `worker2`: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
 
 ```bash
 ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nodes.yaml
+```
+
+Если нужно использовать официальный `pkgs.k8s.io`, переключите источник переменной.
+
+```bash
+ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nodes.yaml -e kubernetes_repo_source=official
 ```
 
 Инициализировать single-master cluster на `master1`.
@@ -86,10 +100,16 @@ ansible-playbook -i inventory/multinode-lan.ini playbooks/common/99-full-cleanup
 ansible-playbook -i inventory/multinode-lan.ini playbooks/common/00-network-check.yaml
 ```
 
-Подготовить все master и worker узлы: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl.
+Подготовить все master и worker узлы: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
 
 ```bash
 ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-nodes.yaml
+```
+
+Если нужно использовать официальный `pkgs.k8s.io`, переключите источник переменной.
+
+```bash
+ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-nodes.yaml -e kubernetes_repo_source=official
 ```
 
 Настроить keepalived VIP на `master1`, `master2`, `master3`.
@@ -129,6 +149,12 @@ ansible-playbook playbooks/_operator/09-reset-vm-wait-ssh.yaml -e target_vm=work
 
 ```bash
 ansible-playbook -i inventory/multinode-lan.ini playbooks/_operator/10-stop-interrupted-playbook-processes.yaml
+```
+
+Запустить старый служебный вариант подготовки узлов из `_operator`.
+
+```bash
+ansible-playbook -i inventory/multinode-lan.ini playbooks/_operator/01-prepare-nodes.yaml
 ```
 
 Установить kube-prometheus-stack и Grafana только когда мониторинг действительно нужен.
