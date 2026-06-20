@@ -8,8 +8,8 @@
 #
 # Что делает:
 #   Настраивает hostname, отключает swap, правит /etc/hosts, включает нужные
-#   kernel modules/sysctl, ставит Docker, cri-dockerd, kubeadm, kubelet и kubectl,
-#   фиксирует версии Kubernetes-пакетов через hold.
+#   kernel modules/sysctl, ставит Docker, cri-dockerd, kubeadm, kubelet, kubectl
+#   и cri-tools, фиксирует версии Kubernetes-пакетов через hold.
 #
 # Важно:
 #   Playbook меняет системную конфигурацию и требует sudo. Kubernetes version и
@@ -112,6 +112,7 @@
           - ca-certificates
           - curl
           - gnupg
+          - conntrack
           - software-properties-common
         state: present
         update_cache: yes
@@ -337,6 +338,7 @@
           - kubeadm
           - kubelet
           - kubectl
+          - cri-tools
         state: present
         update_cache: no
         lock_timeout: 600
@@ -356,6 +358,7 @@
         - kubeadm
         - kubelet
         - kubectl
+        - cri-tools
       tags:
         - kubernetes
 

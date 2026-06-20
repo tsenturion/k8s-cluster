@@ -92,6 +92,8 @@
   serial: 1
 
   vars:
+    cri_socket: "unix:///run/cri-dockerd.sock"
+    cri_socket_path: "/run/cri-dockerd.sock"
     kube_user: "admin"
     join_script_remote: "/tmp/controlplane_join.sh"
 
@@ -107,6 +109,54 @@
         src: /tmp/controlplane_join.sh
         dest: "{{ join_script_remote }}"
         mode: "0700"
+      when: not kubelet_conf.stat.exists
+
+    - name: Запустить Docker перед подключением control-plane
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Запустить cri-docker socket перед подключением control-plane
+      systemd:
+        name: cri-docker.socket
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Перезапустить cri-docker service перед подключением control-plane
+      systemd:
+        name: cri-docker.service
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Дождаться cri-dockerd socket перед подключением control-plane
+      wait_for:
+        path: "{{ cri_socket_path }}"
+        timeout: 30
+      when: not kubelet_conf.stat.exists
+
+    - name: Проверить Docker перед подключением control-plane
+      command: docker info
+      register: docker_ready
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: docker_ready.rc == 0
+      when: not kubelet_conf.stat.exists
+
+    - name: Проверить CRI перед подключением control-plane
+      command: crictl --runtime-endpoint {{ cri_socket }} info
+      register: cri_ready
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: cri_ready.rc == 0
       when: not kubelet_conf.stat.exists
 
     - name: Выполнить подключение control-plane
@@ -176,6 +226,8 @@
   serial: 1
 
   vars:
+    cri_socket: "unix:///run/cri-dockerd.sock"
+    cri_socket_path: "/run/cri-dockerd.sock"
     join_script_remote: "/tmp/worker_join.sh"
 
   tasks:
@@ -190,6 +242,54 @@
         src: /tmp/worker_join.sh
         dest: "{{ join_script_remote }}"
         mode: "0700"
+      when: not kubelet_conf.stat.exists
+
+    - name: Запустить Docker перед подключением worker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Запустить cri-docker socket перед подключением worker
+      systemd:
+        name: cri-docker.socket
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Перезапустить cri-docker service перед подключением worker
+      systemd:
+        name: cri-docker.service
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+      when: not kubelet_conf.stat.exists
+
+    - name: Дождаться cri-dockerd socket перед подключением worker
+      wait_for:
+        path: "{{ cri_socket_path }}"
+        timeout: 30
+      when: not kubelet_conf.stat.exists
+
+    - name: Проверить Docker перед подключением worker
+      command: docker info
+      register: docker_ready
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: docker_ready.rc == 0
+      when: not kubelet_conf.stat.exists
+
+    - name: Проверить CRI перед подключением worker
+      command: crictl --runtime-endpoint {{ cri_socket }} info
+      register: cri_ready
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: cri_ready.rc == 0
       when: not kubelet_conf.stat.exists
 
     - name: Выполнить подключение worker
