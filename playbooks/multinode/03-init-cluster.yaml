@@ -1,3 +1,20 @@
+################################################################################
+# Назначение:
+#   Инициализация первого control-plane узла HA/multinode Kubernetes-кластера.
+#
+# Когда запускать:
+#   В multinode сценарии после common/01-prepare-nodes.yaml и настройки
+#   keepalived VIP. Этот playbook запускается только на master1.
+#
+# Что делает:
+#   Проверяет cri-dockerd socket, выполняет kubeadm init с
+#   --control-plane-endpoint на VIP, готовит kubeconfig для пользователя admin,
+#   генерирует worker/control-plane join scripts и устанавливает Calico.
+#
+# Важно:
+#   control_plane_endpoint должен указывать на работающий VIP. Для single-master
+#   используется другой playbook: playbooks/singlenode/03-init-single-master.yaml.
+################################################################################
 ---
 - name: Инициализация первого управляющего узла Kubernetes (control-plane)
   hosts: master1
@@ -116,11 +133,6 @@
       delay: 10
       changed_when: false
 
-    - name: Удалить дефолтный Installation если существует
-      command: >
-        kubectl --kubeconfig /etc/kubernetes/admin.conf
-        delete installation default --ignore-not-found=true
-        
     - name: Применить конфигурацию Calico Installation
       command: >
         kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -

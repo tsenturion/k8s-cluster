@@ -1,0 +1,198 @@
+################################################################################
+# Назначение:
+#   Остановить процессы, которые могли остаться после ручного прерывания
+#   ansible-playbook через Ctrl+C или закрытия терминала.
+#
+# Когда запускать:
+#   После прерванного playbook-а, если следующий запуск зависает на apt/dpkg,
+#   kubeadm/kubectl/helm или если на ansible-controller остался старый процесс
+#   ansible-playbook. Это служебный recovery playbook, он не входит в обычный
+#   порядок установки single-master или multinode кластера.
+#
+# Что делает:
+#   На ansible-controller останавливает старые процессы ansible-playbook,
+#   исключая текущий запуск этого recovery playbook-а. На целевых узлах
+#   завершает процессы apt/dpkg и Kubernetes/Helm команд, которые обычно
+#   остаются после прерванной установки. После остановки apt/dpkg
+#   удаляет только stale lock-файлы, если пакетный менеджер уже не запущен,
+#   и выполняет dpkg --configure -a, чтобы следующий playbook мог продолжить
+#   установку без ошибки "dpkg was interrupted".
+#
+# Важно:
+#   Playbook намеренно находится в playbooks/_operator, потому что это ручная
+#   аварийная операция. Запускайте его с тем inventory, на котором был прерван
+#   playbook. Если ВМ недоступна по SSH, сначала используйте reset/wait playbook.
+################################################################################
+---
+- name: Остановить старые ansible-playbook процессы на ansible-controller
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Остановить локальные ansible-playbook процессы кроме текущего запуска
+      shell: |
+        set -euo pipefail
+
+        current="$$"
+        ancestors=" $current "
+        pid="$current"
+        while true; do
+          ppid="$(ps -o ppid= -p "$pid" | tr -d ' ' || true)"
+          if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "$pid" ]; then
+            break
+          fi
+          ancestors="$ancestors $ppid "
+          pid="$ppid"
+        done
+
+        targets=""
+        while read -r pid args; do
+          [ -n "${pid:-}" ] || continue
+          case "$ancestors" in
+            *" $pid "*) continue ;;
+          esac
+
+          case "$args" in
+            *ansible-playbook*playbooks/*) targets="$targets $pid" ;;
+          esac
+        done < <(ps -eo pid=,args=)
+
+        if [ -z "${targets// /}" ]; then
+          echo "No old ansible-playbook processes found."
+          exit 0
+        fi
+
+        echo "Stopping old ansible-playbook PIDs:$targets"
+        for pid in $targets; do
+          kill -TERM "$pid" 2>/dev/null || true
+        done
+
+        sleep 3
+        forced=""
+        for pid in $targets; do
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            forced="$forced $pid"
+          fi
+        done
+
+        if [ -n "${forced// /}" ]; then
+          echo "Force killed PIDs:$forced"
+        fi
+      args:
+        executable: /bin/bash
+      register: controller_process_cleanup
+      changed_when: "'Stopping old ansible-playbook PIDs:' in controller_process_cleanup.stdout"
+
+- name: Остановить процессы, оставшиеся после прерванного playbook-а на узлах
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    repair_dpkg_after_interrupt: true
+
+  tasks:
+    - name: Остановить зависшие процессы apt/dpkg/kubeadm/kubectl/helm
+      shell: |
+        set -euo pipefail
+
+        current="$$"
+        ancestors=" $current "
+        pid="$current"
+        while true; do
+          ppid="$(ps -o ppid= -p "$pid" | tr -d ' ' || true)"
+          if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "$pid" ]; then
+            break
+          fi
+          ancestors="$ancestors $ppid "
+          pid="$ppid"
+        done
+
+        targets=""
+        while read -r pid comm args; do
+          [ -n "${pid:-}" ] || continue
+          [ "$pid" != "1" ] || continue
+          case "$ancestors" in
+            *" $pid "*) continue ;;
+          esac
+
+          match="false"
+          case "$comm" in
+            apt|apt-get|dpkg|dpkg-deb|kubeadm|kubectl|helm)
+              match="true"
+              ;;
+          esac
+
+          case "$args" in
+            */usr/lib/apt/methods/*|*AnsiballZ_apt.py*|*AnsiballZ_get_url.py*|*AnsiballZ_unarchive.py*|*AnsiballZ_dpkg_selections.py*)
+              match="true"
+              ;;
+          esac
+
+          if [ "$match" = "true" ]; then
+            targets="$targets $pid"
+          fi
+        done < <(ps -eo pid=,comm=,args=)
+
+        if [ -z "${targets// /}" ]; then
+          echo "No interrupted playbook processes found."
+          exit 0
+        fi
+
+        echo "Stopping interrupted process PIDs:$targets"
+        for pid in $targets; do
+          kill -TERM "$pid" 2>/dev/null || true
+        done
+
+        sleep 5
+        forced=""
+        for pid in $targets; do
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            forced="$forced $pid"
+          fi
+        done
+
+        if [ -n "${forced// /}" ]; then
+          echo "Force killed PIDs:$forced"
+        fi
+      args:
+        executable: /bin/bash
+      register: node_process_cleanup
+      changed_when: "'Stopping interrupted process PIDs:' in node_process_cleanup.stdout"
+
+    - name: Проверить активные процессы apt/dpkg после остановки
+      shell: |
+        set -euo pipefail
+        ps -eo pid=,comm=,args= \
+          | awk '$2 == "apt" || $2 == "apt-get" || $2 == "dpkg" || $2 == "dpkg-deb" {print}'
+      args:
+        executable: /bin/bash
+      register: apt_dpkg_processes_after_cleanup
+      changed_when: false
+
+    - name: Удалить stale lock-файлы apt/dpkg
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/dpkg/lock
+        - /var/lib/dpkg/lock-frontend
+        - /var/lib/apt/lists/lock
+        - /var/cache/apt/archives/lock
+      when: apt_dpkg_processes_after_cleanup.stdout | trim == ""
+
+    - name: Восстановить состояние dpkg после прерванной установки
+      shell: |
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        timeout 300 dpkg --configure -a
+      args:
+        executable: /bin/bash
+      register: dpkg_reconfigure_after_interrupt
+      changed_when: dpkg_reconfigure_after_interrupt.stdout | trim != ""
+      when:
+        - repair_dpkg_after_interrupt | bool
+        - apt_dpkg_processes_after_cleanup.stdout | trim == ""

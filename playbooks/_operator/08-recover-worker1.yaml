@@ -1,0 +1,139 @@
+################################################################################
+# Назначение:
+#   Служебный remediation playbook для восстановления worker1, если ВМ/SSH/kubelet
+#   зависли и Kubernetes видит узел NotReady.
+#
+# Когда запускать:
+#   Только вручную при аварийном состоянии worker1. В обычный fresh install flow
+#   он не нужен: после очистки и подготовки worker-ы подключаются через
+#   playbooks/singlenode/04-join-workers.yaml.
+#
+# Что делает:
+#   Через VBoxManage делает reset/start worker1, ждет SSH, запускает Docker,
+#   cri-dockerd и kubelet, затем с master1 ждет возвращения node/worker1 в Ready.
+#
+# Важно:
+#   Это операторская recovery операция с перезагрузкой ВМ. Не запускать без
+#   понимания, что worker1 можно безопасно перезапустить.
+################################################################################
+---
+- name: Перезагрузить worker1 VM через VirtualBox
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vboxmanage: "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+    worker_vm: "worker1"
+    worker_host: "192.168.0.36"
+    worker_ssh_port: 22
+
+  tasks:
+    - name: Получить список запущенных VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - list
+          - runningvms
+      register: running_vms
+      changed_when: false
+
+    - name: Reset worker1 если VM запущена
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - controlvm
+          - "{{ worker_vm }}"
+          - reset
+      when: running_vms.stdout is search('\"' ~ worker_vm ~ '\"')
+
+    - name: Запустить worker1 если VM была остановлена
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - startvm
+          - "{{ worker_vm }}"
+          - --type
+          - headless
+      when: running_vms.stdout is not search('\"' ~ worker_vm ~ '\"')
+
+    - name: Дождаться SSH на worker1
+      wait_for:
+        host: "{{ worker_host }}"
+        port: "{{ worker_ssh_port }}"
+        state: started
+        connect_timeout: 5
+        sleep: 5
+        timeout: 420
+
+- name: Восстановить kubelet/runtime на worker1
+  hosts: worker1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Запустить Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Запустить cri-docker.socket
+      systemd:
+        name: cri-docker.socket
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Перезапустить cri-docker.service
+      systemd:
+        name: cri-docker.service
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Перезапустить kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Показать статус kubelet
+      command: systemctl --no-pager --full status kubelet
+      register: kubelet_status
+      changed_when: false
+      failed_when: false
+
+    - name: Вывести статус kubelet
+      debug:
+        var: kubelet_status.stdout_lines
+
+- name: Дождаться возвращения worker1 в Kubernetes
+  hosts: master1
+  become: true
+  gather_facts: false
+
+  vars:
+    kubeconfig: "/etc/kubernetes/admin.conf"
+    worker_node: "worker1"
+
+  tasks:
+    - name: Дождаться Ready worker1
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        wait node/{{ worker_node }}
+        --for=condition=Ready
+        --timeout=600s
+      register: worker_ready
+      changed_when: false
+
+    - name: Показать узлы
+      command: kubectl --kubeconfig {{ kubeconfig }} get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести узлы
+      debug:
+        var: nodes_output.stdout_lines

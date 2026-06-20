@@ -1,0 +1,109 @@
+################################################################################
+# Назначение:
+#   Финальная настройка fresh single-master кластера после join worker-ов.
+#
+# Когда запускать:
+#   Последним шагом basic single-master установки, после init master1 и
+#   подключения worker1/worker2.
+#
+# Что делает:
+#   Ждет Ready worker-узлов, закрепляет master1 как dedicated control-plane,
+#   уменьшает CoreDNS до одного replica для lab-кластера, перезапускает rollout
+#   CoreDNS после join worker-ов и проверяет готовность Calico Installation.
+#
+# Важно:
+#   Здесь нет удаления monitoring, force cleanup или recovery-логики. Playbook
+#   рассчитан на чистую установку с нуля после common/99-full-cleanup.yaml.
+################################################################################
+---
+- name: Финальная настройка fresh single-master кластера
+  hosts: master1
+  become: true
+  gather_facts: false
+
+  vars:
+    kubeconfig: "/etc/kubernetes/admin.conf"
+    master_node: "master1"
+    coredns_replicas: 1
+    restart_coredns_after_worker_join: true
+
+  tasks:
+    - name: Проверить наличие admin.conf
+      stat:
+        path: "{{ kubeconfig }}"
+      register: admin_conf
+
+    - name: Завершить выполнение если кластер не инициализирован
+      fail:
+        msg: "Кластер еще не создан или kubeconfig отсутствует: {{ kubeconfig }}"
+      when: not admin_conf.stat.exists
+
+    - name: Дождаться Ready worker-узлов
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        wait node/{{ item }}
+        --for=condition=Ready
+        --timeout=300s
+      loop: "{{ groups.get('workers', []) }}"
+      changed_when: false
+
+    - name: Оставить master1 dedicated control-plane
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        taint nodes {{ master_node }}
+        node-role.kubernetes.io/control-plane=:NoSchedule
+        --overwrite
+      register: taint_result
+      changed_when: "'tainted' in taint_result.stdout or 'modified' in taint_result.stdout"
+
+    - name: Установить один replica CoreDNS для lab single-master
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        scale deployment/coredns
+        --replicas={{ coredns_replicas }}
+      register: coredns_scale
+      changed_when: "'scaled' in coredns_scale.stdout"
+
+    - name: Перезапустить CoreDNS после join worker-узлов
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        rollout restart deployment/coredns
+      register: coredns_restart
+      changed_when: "'restarted' in coredns_restart.stdout"
+      when: restart_coredns_after_worker_join
+
+    - name: Дождаться готовности CoreDNS
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        rollout status deployment/coredns
+        --timeout=300s
+      changed_when: false
+
+    - name: Дождаться готовности Calico Installation
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        wait installation default
+        --for=condition=Ready
+        --timeout=600s
+      changed_when: false
+
+    - name: Показать узлы
+      command: kubectl --kubeconfig {{ kubeconfig }} get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести узлы
+      debug:
+        var: nodes_output.stdout_lines
+
+    - name: Показать системные pod-ы
+      command: kubectl --kubeconfig {{ kubeconfig }} get pods -A -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Вывести системные pod-ы
+      debug:
+        var: pods_output.stdout_lines

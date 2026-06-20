@@ -1,12 +1,42 @@
+################################################################################
+# Назначение:
+#   Базовая подготовка Ubuntu-узлов к Kubernetes с Docker + cri-dockerd.
+#
+# Когда запускать:
+#   После полной очистки или на свежих ВМ, до любых kubeadm init/join playbook-ов.
+#   Один и тот же playbook используется для single-master и multinode топологий.
+#
+# Что делает:
+#   Настраивает hostname, отключает swap, правит /etc/hosts, включает нужные
+#   kernel modules/sysctl, ставит Docker, cri-dockerd, kubeadm, kubelet и kubectl,
+#   фиксирует версии Kubernetes-пакетов через hold.
+#
+# Важно:
+#   Playbook меняет системную конфигурацию и требует sudo. Kubernetes version и
+#   cri-dockerd version задаются в vars внутри файла.
+#   Ошибка на любом узле останавливает весь playbook, чтобы кластер не оказался
+#   частично подготовленным.
+#   Сетевые apt-операции выполняются с ограничением параллельности, потому что
+#   одновременная загрузка пакетов на 5 ВМ в lab-сети часто дает timeout.
+#   Kubernetes-пакеты ставятся последовательно по узлам; для повторного запуска
+#   только этого этапа можно использовать tag kubernetes.
+################################################################################
 ---
 - name: Подготовка всех узлов к установке Kubernetes с Docker
   hosts: all
   become: yes
+  any_errors_fatal: true
   vars:
     # Версия Kubernetes для установки
     kubernetes_version: "1.36"
     # Версия cri-dockerd. Уточните актуальную на https://github.com/Mirantis/cri-dockerd/releases
     cri_dockerd_version: "0.4.3"
+    cri_dockerd_arch: "amd64"
+    cri_dockerd_archive: "cri-dockerd-{{ cri_dockerd_version }}.{{ cri_dockerd_arch }}.tgz"
+    cri_dockerd_url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/{{ cri_dockerd_archive }}"
+    cri_dockerd_local_cache_dir: "/tmp/k8s-cluster-cache"
+    cri_dockerd_local_archive: "{{ cri_dockerd_local_cache_dir }}/{{ cri_dockerd_archive }}"
+    cri_dockerd_remote_archive: "/tmp/{{ cri_dockerd_archive }}"
 
   tasks:
     # 1. ПРЕДВАРИТЕЛЬНАЯ НАСТРОЙКА ОС
@@ -77,6 +107,10 @@
           - software-properties-common
         state: present
         update_cache: yes
+        lock_timeout: 300
+      throttle: 1
+      tags:
+        - base_packages
 
     # 3. УСТАНОВКА DOCKER
     - name: Создать директорию для ключей apt
@@ -113,6 +147,14 @@
           - docker-compose-plugin
         state: present
         update_cache: yes
+        lock_timeout: 600
+      register: docker_install
+      retries: 3
+      delay: 30
+      until: docker_install is succeeded
+      throttle: 1
+      tags:
+        - docker
 
     - name: Запустить и включить Docker
       systemd:
@@ -122,16 +164,41 @@
         daemon_reload: yes
 
     # 4. УСТАНОВКА CRI-DOCKERD
+    - name: Создать локальный cache для cri-dockerd на ansible-controller
+      file:
+        path: "{{ cri_dockerd_local_cache_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Скачать архив cri-dockerd на ansible-controller
+      get_url:
+        url: "{{ cri_dockerd_url }}"
+        dest: "{{ cri_dockerd_local_archive }}"
+        mode: "0644"
+        timeout: 60
+        force: false
+      register: cri_dockerd_download
+      retries: 5
+      delay: 15
+      until: cri_dockerd_download is succeeded
+      delegate_to: localhost
+      become: false
+      run_once: true
+
     - name: Скачать и установить cri-dockerd
       block:
-        - name: Скачать архив cri-dockerd
-          get_url:
-            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
-            dest: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+        - name: Скопировать архив cri-dockerd на узел
+          copy:
+            src: "{{ cri_dockerd_local_archive }}"
+            dest: "{{ cri_dockerd_remote_archive }}"
+            mode: "0644"
 
         - name: Распаковать cri-dockerd
           unarchive:
-            src: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+            src: "{{ cri_dockerd_remote_archive }}"
             dest: /tmp
             remote_src: yes
 
@@ -147,7 +214,7 @@
             path: "{{ item }}"
             state: absent
           loop:
-            - "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+            - "{{ cri_dockerd_remote_archive }}"
             - /tmp/cri-dockerd
 
     - name: Настроить systemd-сервис для cri-dockerd
@@ -208,6 +275,8 @@
         - /etc/apt/sources.list.d/kubernetes.list
         - /etc/apt/sources.list.d/deb.nodesource.com_node_12.x.list 
         - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      tags:
+        - kubernetes
 
     - name: Скачать GPG-ключ репозитория Kubernetes
       shell: >
@@ -215,6 +284,8 @@
         | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      tags:
+        - kubernetes
 
     - name: Добавить репозиторий Kubernetes
       copy:
@@ -222,15 +293,38 @@
         content: |
           deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
         mode: '0644'
+      tags:
+        - kubernetes
 
-    - name: Обновить кэш apt и установить компоненты Kubernetes
+    - name: Обновить кэш apt перед установкой компонентов Kubernetes
+      apt:
+        update_cache: yes
+        cache_valid_time: 0
+        lock_timeout: 600
+      register: k8s_apt_cache
+      retries: 3
+      delay: 30
+      until: k8s_apt_cache is succeeded
+      throttle: 1
+      tags:
+        - kubernetes
+
+    - name: Установить компоненты Kubernetes
       apt:
         name:
           - kubeadm
           - kubelet
           - kubectl
         state: present
-        update_cache: yes
+        update_cache: no
+        lock_timeout: 600
+      register: k8s_install
+      retries: 3
+      delay: 30
+      until: k8s_install is succeeded
+      throttle: 1
+      tags:
+        - kubernetes
 
     - name: Зафиксировать версии пакетов Kubernetes
       dpkg_selections:
@@ -240,8 +334,12 @@
         - kubeadm
         - kubelet
         - kubectl
+      tags:
+        - kubernetes
 
     - name: Включить kubelet (без запуска — он стартует после kubeadm init/join)
       systemd:
         name: kubelet
         enabled: yes
+      tags:
+        - kubernetes

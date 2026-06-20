@@ -1,0 +1,137 @@
+################################################################################
+# Назначение:
+#   Подключение worker1 и worker2 к уже инициализированному single-master кластеру.
+#
+# Когда запускать:
+#   После playbooks/singlenode/03-init-single-master.yaml, когда master1 уже
+#   имеет /etc/kubernetes/admin.conf и Kubernetes API отвечает.
+#
+# Что делает:
+#   На master1 генерирует свежую kubeadm join command, копирует join script на
+#   worker-узлы, выполняет join только если узел еще не в кластере, ждет
+#   регистрацию и Ready каждого worker-а.
+#
+# Важно:
+#   Playbook не подключает master2/master3 и не трогает HA-компоненты. Для HA
+#   используется playbooks/multinode/04-join-cluster.yaml.
+################################################################################
+---
+- name: Сгенерировать join-команду для worker-узлов single-master кластера
+  hosts: master1
+  become: true
+  gather_facts: false
+
+  vars:
+    cri_socket: "unix:///run/cri-dockerd.sock"
+
+  tasks:
+    - name: Проверить наличие admin.conf
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Завершить выполнение если single-master кластер не инициализирован
+      fail:
+        msg: "Кластер еще не создан. Сначала выполните playbooks/singlenode/03-init-single-master.yaml"
+      when: not admin_conf.stat.exists
+
+    - name: Сгенерировать команду подключения worker
+      command: kubeadm token create --print-join-command
+      register: worker_join_command
+      changed_when: false
+
+    - name: Сохранить worker join script на master1
+      copy:
+        dest: /root/worker_join.sh
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ worker_join_command.stdout }} \
+            --cri-socket {{ cri_socket }}
+
+- name: Подключить worker-узлы к single-master кластеру
+  hosts: workers
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    cri_socket: "unix:///run/cri-dockerd.sock"
+    join_script_remote: "/tmp/worker_join.sh"
+
+  tasks:
+    - name: Проверить, входит ли узел в кластер
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Скопировать worker join script
+      copy:
+        dest: "{{ join_script_remote }}"
+        mode: "0700"
+        content: |
+          #!/bin/bash
+          {{ hostvars['master1'].worker_join_command.stdout }} \
+            --cri-socket {{ cri_socket }}
+      when: not kubelet_conf.stat.exists
+
+    - name: Выполнить подключение worker
+      command: bash {{ join_script_remote }}
+      register: join_result
+      when: not kubelet_conf.stat.exists
+
+    - name: Показать результат подключения
+      debug:
+        var: join_result.stdout_lines
+      when:
+        - join_result is defined
+        - join_result.stdout_lines is defined
+
+    - name: Удалить временный join script
+      file:
+        path: "{{ join_script_remote }}"
+        state: absent
+
+    - name: Ожидать регистрацию worker в API
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        get node {{ inventory_hostname }}
+      delegate_to: master1
+      register: node_exists
+      until: node_exists.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Ожидать Ready worker
+      command: >
+        kubectl --kubeconfig /etc/kubernetes/admin.conf
+        wait node/{{ inventory_hostname }}
+        --for=condition=Ready
+        --timeout=300s
+      delegate_to: master1
+      changed_when: false
+
+- name: Проверить состояние single-master кластера после join worker-ов
+  hosts: master1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Показать все узлы
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести список узлов
+      debug:
+        var: nodes_output.stdout_lines
+
+    - name: Показать pod-ы по узлам
+      command: kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -A -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Вывести pod-ы
+      debug:
+        var: pods_output.stdout_lines

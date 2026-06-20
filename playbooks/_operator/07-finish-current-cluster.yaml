@@ -1,0 +1,197 @@
+################################################################################
+# Назначение:
+#   Служебный remediation playbook для уже существующего single-master кластера,
+#   который был перегружен лишним monitoring stack и неверным placement pod-ов.
+#
+# Когда запускать:
+#   Только при ремонте текущего кластера, если он уже создан и нужно убрать
+#   последствия прежней конфигурации. Для установки с нуля использовать
+#   playbooks/singlenode/03/04/05.
+#
+# Что делает:
+#   Удаляет kube-prometheus-stack/namespace monitoring, при необходимости
+#   force-delete зависшие monitoring pod-ы, уменьшает Calico/CoreDNS, возвращает
+#   taint на master1 и выводит состояние узлов/pod-ов.
+#
+# Важно:
+#   Это не fresh install playbook. Он намеренно лежит в playbooks/_operator,
+#   чтобы не смешивать ремонт текущей среды с нормальным порядком установки.
+################################################################################
+---
+- name: Довести текущий single-master Kubernetes до легкой конфигурации
+  hosts: master1
+  become: true
+  gather_facts: false
+
+  vars:
+    kubeconfig: "/etc/kubernetes/admin.conf"
+    master_node: "master1"
+    remove_monitoring_stack: true
+    force_delete_stuck_monitoring_pods: true
+    coredns_replicas: 1
+    calico_control_plane_replicas: 1
+    move_coredns_from_master: true
+
+  tasks:
+    - name: Проверить наличие kubeconfig
+      stat:
+        path: "{{ kubeconfig }}"
+      register: kubeconfig_file
+
+    - name: Завершить выполнение если kubeconfig отсутствует
+      fail:
+        msg: "Kubernetes не инициализирован или отсутствует {{ kubeconfig }}"
+      when: not kubeconfig_file.stat.exists
+
+    - name: Проверить наличие Helm release kube-prom-stack
+      command: helm status kube-prom-stack -n monitoring
+      register: monitoring_release
+      changed_when: false
+      failed_when: false
+      when: remove_monitoring_stack
+
+    - name: Удалить kube-prometheus-stack
+      command: >
+        helm uninstall kube-prom-stack
+        -n monitoring
+        --wait
+        --timeout 10m
+      register: helm_uninstall
+      when:
+        - remove_monitoring_stack
+        - monitoring_release.rc == 0
+
+    - name: Удалить namespace monitoring
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        delete namespace monitoring
+        --ignore-not-found=true
+        --wait=false
+      register: monitoring_namespace_delete
+      changed_when: "'deleted' in monitoring_namespace_delete.stdout"
+      when: remove_monitoring_stack
+
+    - name: Дождаться удаления namespace monitoring
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        get namespace monitoring
+      register: monitoring_namespace
+      until: monitoring_namespace.rc != 0
+      retries: 60
+      delay: 5
+      changed_when: false
+      failed_when: false
+      when: remove_monitoring_stack
+
+    - name: Принудительно удалить pod-ы, если monitoring namespace завис
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n monitoring
+        delete pod --all
+        --force
+        --grace-period=0
+        --ignore-not-found=true
+      register: force_monitoring_pods_delete
+      changed_when: "'deleted' in force_monitoring_pods_delete.stdout"
+      when:
+        - remove_monitoring_stack
+        - force_delete_stuck_monitoring_pods
+        - monitoring_namespace.rc == 0
+
+    - name: Повторно дождаться удаления namespace monitoring после force delete
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        get namespace monitoring
+      register: monitoring_namespace_after_force
+      until: monitoring_namespace_after_force.rc != 0
+      retries: 60
+      delay: 5
+      changed_when: false
+      failed_when: false
+      when:
+        - remove_monitoring_stack
+        - force_delete_stuck_monitoring_pods
+        - monitoring_namespace.rc == 0
+
+    - name: Уменьшить число Calico control-plane replicas
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        patch installation default
+        --type=merge
+        -p '{"spec":{"controlPlaneReplicas":{{ calico_control_plane_replicas }}}}'
+      register: calico_patch
+      changed_when: "'patched' in calico_patch.stdout"
+
+    - name: Вернуть taint dedicated control-plane на master1
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        taint nodes {{ master_node }}
+        node-role.kubernetes.io/control-plane=:NoSchedule
+        --overwrite
+      register: master_taint
+      changed_when: "'tainted' in master_taint.stdout or 'modified' in master_taint.stdout"
+
+    - name: Уменьшить CoreDNS до одного replica
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        scale deployment/coredns
+        --replicas={{ coredns_replicas }}
+      register: coredns_scale
+      changed_when: "'scaled' in coredns_scale.stdout"
+
+    - name: Пересоздать CoreDNS pod-ы на master1 после возврата taint
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        delete pod
+        -l k8s-app=kube-dns
+        --field-selector spec.nodeName={{ master_node }}
+        --ignore-not-found=true
+      register: coredns_delete
+      changed_when: "'deleted' in coredns_delete.stdout"
+      when: move_coredns_from_master
+
+    - name: Дождаться доступности CoreDNS
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n kube-system
+        rollout status deployment/coredns
+        --timeout=300s
+      changed_when: false
+
+    - name: Дождаться доступности Calico kube-controllers
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n calico-system
+        rollout status deployment/calico-kube-controllers
+        --timeout=300s
+      changed_when: false
+
+    - name: Дождаться доступности Calico apiserver
+      command: >
+        kubectl --kubeconfig {{ kubeconfig }}
+        -n calico-system
+        rollout status deployment/calico-apiserver
+        --timeout=300s
+      register: calico_apiserver_rollout
+      changed_when: false
+      failed_when: false
+
+    - name: Показать узлы
+      command: kubectl --kubeconfig {{ kubeconfig }} get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Вывести узлы
+      debug:
+        var: nodes_output.stdout_lines
+
+    - name: Показать pod-ы после облегчения кластера
+      command: kubectl --kubeconfig {{ kubeconfig }} get pods -A -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Вывести pod-ы
+      debug:
+        var: pods_output.stdout_lines

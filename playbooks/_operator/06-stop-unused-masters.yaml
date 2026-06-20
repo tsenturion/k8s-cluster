@@ -1,0 +1,95 @@
+################################################################################
+# Назначение:
+#   Служебный remediation playbook для остановки master2/master3, если после
+#   перехода на single-master они остались запущены от старой HA-схемы.
+#
+# Когда запускать:
+#   Только вручную для обслуживания текущей лабораторной среды. В обычный fresh
+#   install порядок этот playbook не входит: пользователь может остановить эти
+#   ВМ руками через VirtualBox.
+#
+# Что делает:
+#   Останавливает kubelet/keepalived на master2/master3, удаляет keepalived
+#   конфиги и через VBoxManage отправляет ACPI shutdown лишним master VM.
+#
+# Важно:
+#   Это не установка Kubernetes, а операторская cleanup/recovery операция. Не
+#   запускать как часть single-master или multinode fresh install flow.
+################################################################################
+---
+- name: Отключить Kubernetes-сервисы на master2/master3, не используемых в single-master
+  hosts: master2,master3
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Остановить kubelet на неиспользуемом master
+      systemd:
+        name: kubelet
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Остановить keepalived на неиспользуемом master
+      systemd:
+        name: keepalived
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Удалить keepalived конфиги старой HA-схемы
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/keepalived/keepalived.conf
+        - /etc/keepalived/check_apiserver.sh
+      failed_when: false
+
+- name: Остановить лишние VirtualBox VM master2/master3
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vboxmanage: "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+    unused_master_vms:
+      - master2
+      - master3
+
+  tasks:
+    - name: Получить список запущенных VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - list
+          - runningvms
+      register: running_vms
+      changed_when: false
+
+    - name: Отправить ACPI shutdown лишним master VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - controlvm
+          - "{{ item }}"
+          - acpipowerbutton
+      loop: "{{ unused_master_vms }}"
+      when: running_vms.stdout is search('\"' ~ item ~ '\"')
+
+    - name: Дождаться остановки лишних master VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - list
+          - runningvms
+      register: wait_running_vms
+      until: wait_running_vms.stdout is not search('\"master2\"|\"master3\"')
+      retries: 24
+      delay: 5
+      changed_when: false
+
+    - name: Показать оставшиеся запущенные VM
+      debug:
+        var: wait_running_vms.stdout_lines

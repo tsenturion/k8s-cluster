@@ -1,3 +1,20 @@
+################################################################################
+# Назначение:
+#   Настройка keepalived VIP для HA control-plane в multinode кластере.
+#
+# Когда запускать:
+#   Только в multinode сценарии после подготовки узлов и до kubeadm init первого
+#   control-plane. Для single-master этот playbook не нужен.
+#
+# Что делает:
+#   Устанавливает keepalived на master-узлы, рассчитывает MASTER/BACKUP priority,
+#   создает health-check kube-apiserver и конфиг VRRP для virtual_ip.
+#
+# Важно:
+#   VIP и интерфейс заданы в vars: virtual_ip=192.168.0.100, interface=enp0s8.
+#   Они должны соответствовать netplan/VirtualBox сети. Неправильный VIP ломает
+#   control-plane endpoint для HA-кластера.
+################################################################################
 ---
 - name: Keepalived VIP для Kubernetes Control Plane
   hosts: masters

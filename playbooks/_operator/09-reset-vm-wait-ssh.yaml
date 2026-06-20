@@ -1,0 +1,84 @@
+################################################################################
+# Назначение:
+#   Служебный playbook для восстановления доступа к ВМ после зависшего reboot.
+#
+# Когда запускать:
+#   Только вручную, если после cleanup/reboot ВМ запущена в VirtualBox, но SSH не
+#   возвращается, а консоль показывает зависание boot/systemd/udev/fsck.
+#
+# Что делает:
+#   На localhost через VBoxManage выполняет hard reset указанной VM и ждет SSH
+#   на указанном IP/порту. Kubernetes-сервисы не трогает, потому что после
+#   common/99-full-cleanup.yaml kubelet/kubeadm/kubectl уже удалены.
+#
+# Важно:
+#   Это операторская recovery операция. Перед запуском задайте target_vm и
+#   target_host, например:
+#   ansible-playbook playbooks/_operator/09-reset-vm-wait-ssh.yaml \
+#     -e target_vm=worker1 -e target_host=192.168.0.36
+#   ansible-playbook playbooks/_operator/09-reset-vm-wait-ssh.yaml -e target_vm=master1 -e target_host=192.168.0.33
+################################################################################
+---
+- name: Reset VM через VirtualBox и дождаться SSH
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vboxmanage: "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+    target_vm: ""
+    target_host: ""
+    target_port: 22
+    ssh_wait_timeout: 600
+
+  tasks:
+    - name: Проверить, что target_vm задан
+      fail:
+        msg: "Передайте -e target_vm=<VirtualBox VM name>"
+      when: target_vm | length == 0
+
+    - name: Проверить, что target_host задан
+      fail:
+        msg: "Передайте -e target_host=<IP address>"
+      when: target_host | length == 0
+
+    - name: Получить список запущенных VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - list
+          - runningvms
+      register: running_vms
+      changed_when: false
+
+    - name: Hard reset запущенной VM
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - controlvm
+          - "{{ target_vm }}"
+          - reset
+      when: running_vms.stdout is search('\"' ~ target_vm ~ '\"')
+
+    - name: Запустить VM если она была остановлена
+      command:
+        argv:
+          - "{{ vboxmanage }}"
+          - startvm
+          - "{{ target_vm }}"
+          - --type
+          - headless
+      when: running_vms.stdout is not search('\"' ~ target_vm ~ '\"')
+
+    - name: Дождаться SSH после reset/start
+      wait_for:
+        host: "{{ target_host }}"
+        port: "{{ target_port }}"
+        state: started
+        connect_timeout: 5
+        sleep: 5
+        timeout: "{{ ssh_wait_timeout }}"
+
+    - name: Итог
+      debug:
+        msg: "VM {{ target_vm }} доступна по SSH на {{ target_host }}:{{ target_port }}"

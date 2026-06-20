@@ -1,16 +1,55 @@
+################################################################################
+# Назначение:
+#   Полная очистка Kubernetes-узлов перед установкой кластера с нуля.
+#
+# Когда запускать:
+#   Когда нужно гарантированно убрать старый кластер, CNI, kubelet state,
+#   Kubernetes-пакеты и начать fresh install. Подходит для single-master и
+#   multinode inventory.
+#
+# Что делает:
+#   Останавливает kubelet/runtime, размонтирует kubelet mountpoints, чистит
+#   контейнеры, выполняет kubeadm reset, удаляет Kubernetes/CNI директории,
+#   чистит iptables, снимает hold с Kubernetes-пакетов, удаляет kubeadm/kubelet/
+#   kubectl/kubernetes-cni и перезагружает узлы.
+#
+# Важно:
+#   Это разрушительный playbook. После него обязательно снова запускать
+#   common/01-prepare-nodes.yaml перед init/join.
+#   Повторный запуск после уже выполненной очистки допустим: playbook проверяет
+#   наличие kubelet/kubeadm и не считает их отсутствие ошибкой.
+#   Если ВМ реально перезагрузилась, но Ansible не дождался SSH/boot-time check,
+#   проверьте консоль VirtualBox. Для зависшей ВМ можно использовать служебный
+#   playbooks/_operator/09-reset-vm-wait-ssh.yaml.
+################################################################################
 ---
 - name: Полная очистка Kubernetes кластера
   hosts: all
   become: yes
 
+  vars:
+    cleanup_reboot_timeout: 1200
+    cleanup_reboot_connect_timeout: 10
+    cleanup_reboot_pre_delay: 5
+    cleanup_reboot_post_delay: 30
+    cleanup_reboot_test_command: "whoami"
+
   tasks:
+
+    - name: Собрать список systemd сервисов
+      service_facts:
+
+    - name: Проверить наличие kubeadm
+      stat:
+        path: /usr/bin/kubeadm
+      register: kubeadm_binary
 
     - name: Остановка kubelet
       systemd:
         name: kubelet
         state: stopped
         enabled: no
-      ignore_errors: yes
+      when: "'kubelet.service' in ansible_facts.services"
 
     - name: Остановка контейнерных рантаймов
       systemd:
@@ -20,6 +59,7 @@
         - docker
         - containerd
         - cri-docker
+      when: (item ~ '.service') in ansible_facts.services
       ignore_errors: yes
 
     - name: Принудительная размонтирование точек монтирования kubelet
@@ -46,17 +86,19 @@
 
     - name: kubeadm reset с указанием CRI (containerd)
       command: kubeadm reset -f --cri-socket=unix:///var/run/containerd/containerd.sock
+      when: kubeadm_binary.stat.exists
       ignore_errors: yes
 
     - name: Альтернативный kubeadm reset (cri-dockerd если нужен)
       command: kubeadm reset -f --cri-socket=unix:///var/run/cri-dockerd.sock
+      when: kubeadm_binary.stat.exists
       ignore_errors: yes
 
     - name: Повторная остановка kubelet после reset
       systemd:
         name: kubelet
         state: stopped
-      ignore_errors: yes
+      when: "'kubelet.service' in ansible_facts.services"
 
     - name: Удаление Kubernetes директорий
       file:
@@ -142,6 +184,20 @@
 
     - name: Перезагрузка узла
       reboot:
-        reboot_timeout: 600
-        pre_reboot_delay: 5
+        reboot_timeout: "{{ cleanup_reboot_timeout }}"
+        connect_timeout: "{{ cleanup_reboot_connect_timeout }}"
+        pre_reboot_delay: "{{ cleanup_reboot_pre_delay }}"
+        post_reboot_delay: "{{ cleanup_reboot_post_delay }}"
+        test_command: "{{ cleanup_reboot_test_command }}"
+      register: cleanup_reboot
       ignore_errors: yes
+
+    - name: Диагностика не подтвержденной перезагрузки
+      debug:
+        msg:
+          - "Ansible не смог подтвердить перезагрузку {{ inventory_hostname }} за {{ cleanup_reboot_timeout }} секунд."
+          - "Если rebooted=true, ВМ получила команду reboot, но SSH/boot-time check не вернулся вовремя."
+          - "Проверьте консоль VirtualBox и сетевую доступность узла."
+          - "Для зависшей ВМ можно использовать playbooks/_operator/09-reset-vm-wait-ssh.yaml с target_vm/target_host."
+      when:
+        - cleanup_reboot is failed
