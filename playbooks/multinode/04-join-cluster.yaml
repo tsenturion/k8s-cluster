@@ -22,9 +22,20 @@
   become: true
 
   vars:
-    cri_socket: "unix:///run/cri-dockerd.sock"
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    containerd_cri_socket_path: "/run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    docker_cri_socket_path: "/run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
 
   tasks:
+
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
 
     - name: Проверить наличие admin.conf
       stat:
@@ -92,12 +103,23 @@
   serial: 1
 
   vars:
-    cri_socket: "unix:///run/cri-dockerd.sock"
-    cri_socket_path: "/run/cri-dockerd.sock"
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    containerd_cri_socket_path: "/run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    docker_cri_socket_path: "/run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
+    cri_socket_path: "{{ docker_cri_socket_path if container_runtime == 'docker' else containerd_cri_socket_path }}"
     kube_user: "admin"
     join_script_remote: "/tmp/controlplane_join.sh"
 
   tasks:
+
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
 
     - name: Проверить входит ли узел в кластер
       stat:
@@ -111,13 +133,25 @@
         mode: "0700"
       when: not kubelet_conf.stat.exists
 
+    - name: Запустить containerd перед подключением control-plane
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'containerd'
+
     - name: Запустить Docker перед подключением control-plane
       systemd:
         name: docker
         state: started
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Запустить cri-docker socket перед подключением control-plane
       systemd:
@@ -125,7 +159,9 @@
         state: started
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Перезапустить cri-docker service перед подключением control-plane
       systemd:
@@ -133,9 +169,11 @@
         state: restarted
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
-    - name: Дождаться cri-dockerd socket перед подключением control-plane
+    - name: Дождаться CRI socket перед подключением control-plane
       wait_for:
         path: "{{ cri_socket_path }}"
         timeout: 30
@@ -148,7 +186,9 @@
       retries: 12
       delay: 5
       until: docker_ready.rc == 0
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Проверить CRI перед подключением control-plane
       command: crictl --runtime-endpoint {{ cri_socket }} info
@@ -226,11 +266,22 @@
   serial: 1
 
   vars:
-    cri_socket: "unix:///run/cri-dockerd.sock"
-    cri_socket_path: "/run/cri-dockerd.sock"
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    containerd_cri_socket_path: "/run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    docker_cri_socket_path: "/run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
+    cri_socket_path: "{{ docker_cri_socket_path if container_runtime == 'docker' else containerd_cri_socket_path }}"
     join_script_remote: "/tmp/worker_join.sh"
 
   tasks:
+
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
 
     - name: Проверить входит ли узел в кластер
       stat:
@@ -244,13 +295,25 @@
         mode: "0700"
       when: not kubelet_conf.stat.exists
 
+    - name: Запустить containerd перед подключением worker
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'containerd'
+
     - name: Запустить Docker перед подключением worker
       systemd:
         name: docker
         state: started
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Запустить cri-docker socket перед подключением worker
       systemd:
@@ -258,7 +321,9 @@
         state: started
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Перезапустить cri-docker service перед подключением worker
       systemd:
@@ -266,9 +331,11 @@
         state: restarted
         enabled: yes
         daemon_reload: yes
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
-    - name: Дождаться cri-dockerd socket перед подключением worker
+    - name: Дождаться CRI socket перед подключением worker
       wait_for:
         path: "{{ cri_socket_path }}"
         timeout: 30
@@ -281,7 +348,9 @@
       retries: 12
       delay: 5
       until: docker_ready.rc == 0
-      when: not kubelet_conf.stat.exists
+      when:
+        - not kubelet_conf.stat.exists
+        - container_runtime == 'docker'
 
     - name: Проверить CRI перед подключением worker
       command: crictl --runtime-endpoint {{ cri_socket }} info

@@ -1,6 +1,6 @@
 ################################################################################
 # Назначение:
-#   Базовая подготовка Ubuntu-узлов к Kubernetes с Docker + cri-dockerd.
+#   Базовая подготовка Ubuntu-узлов к Kubernetes с выбранным container runtime.
 #
 # Когда запускать:
 #   После полной очистки или на свежих ВМ, до любых kubeadm init/join playbook-ов.
@@ -8,12 +8,13 @@
 #
 # Что делает:
 #   Настраивает hostname, отключает swap, правит /etc/hosts, включает нужные
-#   kernel modules/sysctl, ставит Docker, cri-dockerd, kubeadm, kubelet, kubectl
-#   и cri-tools, фиксирует версии Kubernetes-пакетов через hold.
+#   kernel modules/sysctl, ставит containerd по умолчанию или Docker +
+#   cri-dockerd при явном выборе, затем kubeadm, kubelet, kubectl и cri-tools,
+#   фиксирует версии Kubernetes-пакетов через hold.
 #
 # Важно:
-#   Playbook меняет системную конфигурацию и требует sudo. Kubernetes version и
-#   cri-dockerd version задаются в vars внутри файла.
+#   Playbook меняет системную конфигурацию и требует sudo. Kubernetes version,
+#   container runtime и cri-dockerd version задаются в vars внутри файла.
 #   Ошибка на любом узле останавливает весь playbook, чтобы кластер не оказался
 #   частично подготовленным.
 #   Сетевые apt-операции выполняются с ограничением параллельности, потому что
@@ -23,15 +24,26 @@
 #   По умолчанию Kubernetes apt repository берется с Yandex mirror. Чтобы
 #   использовать официальный pkgs.k8s.io, передайте:
 #   -e kubernetes_repo_source=official
+#   По умолчанию используется containerd. Чтобы использовать прежний вариант
+#   Docker + cri-dockerd, передайте:
+#   -e container_runtime=docker
 ################################################################################
 ---
-- name: Подготовка всех узлов к установке Kubernetes с Docker
+- name: Подготовка всех узлов к установке Kubernetes
   hosts: all
   become: yes
   any_errors_fatal: true
   vars:
     # Версия Kubernetes для установки
     kubernetes_version: "1.36"
+    # Container runtime: containerd или docker. docker означает Docker + cri-dockerd.
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    containerd_cri_socket_path: "/run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    docker_cri_socket_path: "/run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
+    cri_socket_path: "{{ docker_cri_socket_path if container_runtime == 'docker' else containerd_cri_socket_path }}"
     # Источник Kubernetes apt repository: yandex или official
     kubernetes_repo_source: "yandex"
     kubernetes_repo_yandex_url: "https://mirror.yandex.ru/mirrors/pkgs.k8s.io/core/stable/v{{ kubernetes_version }}"
@@ -47,6 +59,16 @@
     cri_dockerd_remote_archive: "/tmp/{{ cri_dockerd_archive }}"
 
   tasks:
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
+
+    - name: Показать выбранный container runtime
+      debug:
+        msg: "Container runtime={{ container_runtime }}, CRI socket={{ cri_socket }}"
+
     # 1. ПРЕДВАРИТЕЛЬНАЯ НАСТРОЙКА ОС
     - name: Установить hostname согласно inventory
       hostname:
@@ -121,12 +143,70 @@
       tags:
         - base_packages
 
-    # 3. УСТАНОВКА DOCKER
+    # 3. УСТАНОВКА CONTAINERD ИЛИ DOCKER + CRI-DOCKERD
     - name: Создать директорию для ключей apt
       file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
+
+    - name: Установить containerd
+      apt:
+        name:
+          - containerd
+        state: present
+        update_cache: yes
+        lock_timeout: 600
+      register: containerd_install
+      retries: 3
+      delay: 30
+      until: containerd_install is succeeded
+      throttle: 1
+      when: container_runtime == 'containerd'
+      tags:
+        - container_runtime
+        - containerd
+
+    - name: Создать директорию конфигурации containerd
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+      when: container_runtime == 'containerd'
+      tags:
+        - container_runtime
+        - containerd
+
+    - name: Получить default-конфигурацию containerd
+      command: containerd config default
+      register: containerd_default_config
+      changed_when: false
+      when: container_runtime == 'containerd'
+      tags:
+        - container_runtime
+        - containerd
+
+    - name: Настроить containerd для Kubernetes с systemd cgroups
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}\n"
+        mode: "0644"
+      register: containerd_config
+      when: container_runtime == 'containerd'
+      tags:
+        - container_runtime
+        - containerd
+
+    - name: Запустить и включить containerd
+      systemd:
+        name: containerd
+        state: "{{ 'restarted' if (containerd_config.changed | default(false)) else 'started' }}"
+        enabled: yes
+        daemon_reload: yes
+      when: container_runtime == 'containerd'
+      tags:
+        - container_runtime
+        - containerd
 
     - name: Добавить официальный GPG-ключ Docker
       shell: |
@@ -134,10 +214,18 @@
         chmod a+r /etc/apt/keyrings/docker.asc
       args:
         creates: /etc/apt/keyrings/docker.asc
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Определить архитектуру
       set_fact:
         docker_arch: "{{ 'amd64' if ansible_facts['architecture'] == 'x86_64' else 'arm64' }}"
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Добавить репозиторий Docker
       copy:
@@ -145,6 +233,10 @@
         content: |
           deb [arch={{ docker_arch }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable
         mode: '0644'
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Обновить кэш apt и установить Docker
       apt:
@@ -162,7 +254,9 @@
       delay: 30
       until: docker_install is succeeded
       throttle: 1
+      when: container_runtime == 'docker'
       tags:
+        - container_runtime
         - docker
 
     - name: Запустить и включить Docker
@@ -171,8 +265,11 @@
         state: started
         enabled: yes
         daemon_reload: yes
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
-    # 4. УСТАНОВКА CRI-DOCKERD
     - name: Создать локальный cache для cri-dockerd на ansible-controller
       file:
         path: "{{ cri_dockerd_local_cache_dir }}"
@@ -181,6 +278,10 @@
       delegate_to: localhost
       become: false
       run_once: true
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Скачать архив cri-dockerd на ansible-controller
       get_url:
@@ -196,6 +297,10 @@
       delegate_to: localhost
       become: false
       run_once: true
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Скачать и установить cri-dockerd
       block:
@@ -225,6 +330,10 @@
           loop:
             - "{{ cri_dockerd_remote_archive }}"
             - /tmp/cri-dockerd
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Настроить systemd-сервис для cri-dockerd
       copy:
@@ -247,6 +356,10 @@
 
           [Install]
           WantedBy=multi-user.target
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Настроить systemd-сокет для cri-dockerd
       copy:
@@ -264,6 +377,10 @@
 
           [Install]
           WantedBy=sockets.target
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
     - name: Перезапустить systemd, запустить и включить cri-dockerd
       systemd:
@@ -274,8 +391,12 @@
       loop:
         - cri-docker.socket
         - cri-docker.service
+      when: container_runtime == 'docker'
+      tags:
+        - container_runtime
+        - docker
 
-    # 5. УСТАНОВКА КОМПОНЕНТОВ KUBERNETES
+    # 4. УСТАНОВКА КОМПОНЕНТОВ KUBERNETES
     - name: Проверить выбранный источник Kubernetes repository
       assert:
         that:
@@ -367,4 +488,36 @@
         name: kubelet
         enabled: yes
       tags:
+        - kubernetes
+
+    - name: Настроить crictl на выбранный CRI endpoint
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: {{ cri_socket }}
+          image-endpoint: {{ cri_socket }}
+          timeout: 10
+          debug: false
+        mode: "0644"
+      tags:
+        - container_runtime
+        - kubernetes
+
+    - name: Дождаться CRI socket выбранного runtime
+      wait_for:
+        path: "{{ cri_socket_path }}"
+        timeout: 60
+      tags:
+        - container_runtime
+        - kubernetes
+
+    - name: Проверить CRI выбранного runtime
+      command: crictl --runtime-endpoint {{ cri_socket }} info
+      register: cri_ready
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: cri_ready.rc == 0
+      tags:
+        - container_runtime
         - kubernetes

@@ -7,7 +7,7 @@
 #   keepalived VIP. Этот playbook запускается только на master1.
 #
 # Что делает:
-#   Проверяет cri-dockerd socket, выполняет kubeadm init с
+#   Проверяет CRI socket выбранного runtime, выполняет kubeadm init с
 #   --control-plane-endpoint на VIP, готовит kubeconfig для пользователя admin,
 #   генерирует worker/control-plane join scripts и устанавливает Calico.
 #
@@ -24,21 +24,33 @@
     control_plane_endpoint: "192.168.0.100:6443"
     pod_network_cidr: "10.244.0.0/16"
     service_cidr: "10.96.0.0/12"
-    cri_socket: "unix:///run/cri-dockerd.sock"
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    containerd_cri_socket_path: "/run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    docker_cri_socket_path: "/run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
+    cri_socket_path: "{{ docker_cri_socket_path if container_runtime == 'docker' else containerd_cri_socket_path }}"
     kube_user: "admin"
     calico_version: "v3.32.0"
     calico_interface: "enp0s8"
 
   tasks:
 
-    - name: Проверить наличие сокета cri-dockerd
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
+
+    - name: Проверить наличие CRI socket выбранного runtime
       stat:
-        path: /run/cri-dockerd.sock
+        path: "{{ cri_socket_path }}"
       register: cri_socket_file
 
-    - name: Завершить с ошибкой, если сокет cri-dockerd отсутствует
+    - name: Завершить с ошибкой, если CRI socket отсутствует
       fail:
-        msg: "Сокет cri-dockerd /run/cri-dockerd.sock не найден"
+        msg: "CRI socket {{ cri_socket_path }} для container_runtime={{ container_runtime }} не найден"
       when: not cri_socket_file.stat.exists
 
     - name: Проверить, инициализирован ли уже кластер

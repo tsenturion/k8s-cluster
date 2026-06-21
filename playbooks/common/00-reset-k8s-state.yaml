@@ -1,7 +1,7 @@
 ################################################################################
 # Назначение:
 #   Мягкий сброс Kubernetes-состояния перед повторной установкой, без удаления
-#   установленных пакетов Docker, cri-dockerd, kubeadm, kubelet и kubectl.
+#   установленных пакетов container runtime, kubeadm, kubelet и kubectl.
 #
 # Когда запускать:
 #   Когда нужно переинициализировать кластер поверх уже подготовленных узлов,
@@ -26,11 +26,20 @@
 
   vars:
     kube_user: "admin"
-    cri_socket: "unix:///run/cri-dockerd.sock"
+    container_runtime: "containerd"
+    containerd_cri_socket: "unix:///run/containerd/containerd.sock"
+    docker_cri_socket: "unix:///run/cri-dockerd.sock"
+    cri_socket: "{{ docker_cri_socket if container_runtime == 'docker' else containerd_cri_socket }}"
     reset_keepalived: true
     reset_iptables: true
 
   tasks:
+    - name: Проверить выбранный container runtime
+      assert:
+        that:
+          - container_runtime in ['containerd', 'docker']
+        fail_msg: "container_runtime должен быть containerd или docker."
+
     - name: Остановить kubelet
       systemd:
         name: kubelet
@@ -114,12 +123,21 @@
       failed_when: false
       changed_when: false
 
+    - name: Перезапустить containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+      failed_when: false
+      when: container_runtime == 'containerd'
+
     - name: Перезапустить Docker
       systemd:
         name: docker
         state: restarted
         enabled: true
       failed_when: false
+      when: container_runtime == 'docker'
 
     - name: Перезапустить cri-docker.socket
       systemd:
@@ -128,6 +146,7 @@
         enabled: true
         daemon_reload: true
       failed_when: false
+      when: container_runtime == 'docker'
 
     - name: Перезапустить cri-docker.service
       systemd:
@@ -136,6 +155,7 @@
         enabled: true
         daemon_reload: true
       failed_when: false
+      when: container_runtime == 'docker'
 
     - name: Включить kubelet, но не запускать до kubeadm init
       systemd:
@@ -148,5 +168,6 @@
       debug:
         msg:
           - "Сброс Kubernetes-состояния завершён на {{ inventory_hostname }}"
-          - "Docker/cri-dockerd/kubeadm/kubelet/kubectl не удалялись"
+          - "container_runtime={{ container_runtime }}, CRI socket={{ cri_socket }}"
+          - "Container runtime/kubeadm/kubelet/kubectl не удалялись"
           - "Теперь можно запускать init для нужной топологии"

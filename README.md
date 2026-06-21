@@ -18,6 +18,16 @@
 
 `ansible.cfg` оставлен на старом `inventory/lan.ini`, поэтому инвентарь лучше указывать явно через `-i`.
 
+## Container Runtime
+
+По умолчанию fresh install использует `containerd`. Это меньше нагружает lab-кластер, чем связка Docker + `cri-dockerd`, и является стандартным runtime для Kubernetes.
+
+Если нужно вернуть прежний вариант Docker + `cri-dockerd`, передавайте одну и ту же переменную во все runtime-зависимые playbook-и выбранного сценария:
+
+```bash
+-e container_runtime=docker
+```
+
 ## Диагностика
 
 Посмотреть load average, текущую CPU-нагрузку и память на узлах single-master кластера.
@@ -50,7 +60,7 @@ ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/99-full-cleanu
 ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/00-network-check.yaml
 ```
 
-Подготовить `master1`, `worker1`, `worker2`: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
+Подготовить `master1`, `worker1`, `worker2`: OS, containerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
 
 ```bash
 ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nodes.yaml
@@ -60,6 +70,14 @@ ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nod
 
 ```bash
 ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nodes.yaml -e kubernetes_repo_source=official
+```
+
+Если нужен прежний runtime Docker + `cri-dockerd`, подготовку и следующие init/join playbook-и запускайте с `container_runtime=docker`.
+
+```bash
+ansible-playbook -i inventory/singlenode-lan.ini playbooks/common/01-prepare-nodes.yaml -e container_runtime=docker
+ansible-playbook -i inventory/singlenode-lan.ini playbooks/singlenode/03-init-single-master.yaml -e container_runtime=docker
+ansible-playbook -i inventory/singlenode-lan.ini playbooks/singlenode/04-join-workers.yaml -e container_runtime=docker
 ```
 
 Инициализировать single-master cluster на `master1`.
@@ -100,7 +118,7 @@ ansible-playbook -i inventory/multinode-lan.ini playbooks/common/99-full-cleanup
 ansible-playbook -i inventory/multinode-lan.ini playbooks/common/00-network-check.yaml
 ```
 
-Подготовить все master и worker узлы: OS, Docker, cri-dockerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
+Подготовить все master и worker узлы: OS, containerd, kubeadm, kubelet, kubectl. По умолчанию Kubernetes-пакеты берутся с Yandex mirror.
 
 ```bash
 ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-nodes.yaml
@@ -110,6 +128,14 @@ ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-node
 
 ```bash
 ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-nodes.yaml -e kubernetes_repo_source=official
+```
+
+Если нужен прежний runtime Docker + `cri-dockerd`, подготовку и следующие init/join playbook-и запускайте с `container_runtime=docker`.
+
+```bash
+ansible-playbook -i inventory/multinode-lan.ini playbooks/common/01-prepare-nodes.yaml -e container_runtime=docker
+ansible-playbook -i inventory/multinode-lan.ini playbooks/multinode/03-init-cluster.yaml -e container_runtime=docker
+ansible-playbook -i inventory/multinode-lan.ini playbooks/multinode/04-join-cluster.yaml -e container_runtime=docker
 ```
 
 Настроить keepalived VIP на `master1`, `master2`, `master3`.
